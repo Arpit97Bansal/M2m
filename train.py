@@ -20,6 +20,7 @@ from tqdm import tqdm
 from utils import random_perturb, make_step, inf_data_gen, Logger
 from utils import soft_cross_entropy, classwise_loss, LDAMLoss, FocalLoss
 from config import *
+from models_our import ResNet18
 
 
 LOGNAME = 'Imbalance_' + LOGFILE_BASE
@@ -37,7 +38,7 @@ if not os.path.exists(LOG_CSV):
         csv_writer.writerow(LOG_CSV_HEADER)
 
 
-def save_checkpoint(acc, model, optim, epoch, index=False):
+def save_checkpoint(acc, model, optim, epoch, imb_type, index=False):
     # Save checkpoint.
     print('Saving..')
 
@@ -53,9 +54,9 @@ def save_checkpoint(acc, model, optim, epoch, index=False):
     }
 
     if index:
-        ckpt_name = 'ckpt_epoch' + str(epoch) + '_' + str(SEED) + '.t7'
+        ckpt_name = 'ckpt_epoch' + imb_type + "_" + str(epoch) + '_' + str(SEED) + '.t7'
     else:
-        ckpt_name = 'ckpt_' + str(SEED) + '.t7'
+        ckpt_name = 'ckpt_' + imb_type + "_" + str(SEED) + '.t7'
 
     ckpt_path = os.path.join(LOGDIR, ckpt_name)
     torch.save(state, ckpt_path)
@@ -246,7 +247,7 @@ def train_gen_epoch(net_t, net_g, criterion, optimizer, data_loader):
         # Set a generation target for current batch with re-sampling
         if ARGS.imb_type != 'none':  # Imbalanced
             # Keep the sample with this probability
-            gen_probs = N_SAMPLES_PER_CLASS_T[targets] / N_SAMPLES_PER_CLASS_T[0]
+            gen_probs = N_SAMPLES_PER_CLASS_T[targets] / N_SAMPLES_PER_CLASS_T[MAX_CLASS]
             gen_index = (1 - torch.bernoulli(gen_probs)).nonzero()    # Generation index
             gen_index = gen_index.view(-1)
             gen_targets = targets[gen_index]
@@ -293,13 +294,24 @@ def train_gen_epoch(net_t, net_g, criterion, optimizer, data_loader):
 
 
 if __name__ == '__main__':
-    TEST_ACC = 0  # best test accuracy
-    BEST_VAL = 0  # best validation accuracy
+
+    torch.manual_seed(222)
+    torch.cuda.manual_seed_all(222)
+    np.random.seed(222)
+    random.seed(222)
+
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
     # Weights for virtual samples are generated
+
+    TEST_ACC = 0  # best test accuracyf
+
+    # Weights for virtual samples are generated
+    MODEL = 'ResNet18'
     logger.log('==> Building model: %s' % MODEL)
-    net = models.__dict__[MODEL](N_CLASSES)
-    net_seed = models.__dict__[MODEL](N_CLASSES)
+    net = ResNet18() #models.__dict__[MODEL](N_CLASSES)
+    net_seed = ResNet18() #models.__dict__[MODEL](N_CLASSES)
 
     net, net_seed = net.to(device), net_seed.to(device)
     optimizer = optim.SGD(net.parameters(), lr=ARGS.lr, momentum=0.9, weight_decay=ARGS.decay)
@@ -348,12 +360,13 @@ if __name__ == '__main__':
         if epoch == ARGS.warm and ARGS.over:
             if ARGS.smote:
                 logger.log("=============== Applying smote sampling ===============")
-                smote_loader, _, _ = get_smote(DATASET, N_SAMPLES_PER_CLASS, BATCH_SIZE, transform_train, transform_test)
+                smote_loader, _, _ = get_smote(DATASET, N_SAMPLES_PER_CLASS, BATCH_SIZE, transform_train,
+                                               transform_test)
                 smote_loader_inf = inf_data_gen(smote_loader)
             else:
                 logger.log("=============== Applying over sampling ===============")
                 train_loader, _, _ = get_oversampled(DATASET, N_SAMPLES_PER_CLASS, BATCH_SIZE,
-                                                     transform_train, transform_test)
+                                                     transform_train, transform_test, ARGS.imb_type, fractions, False)
 
         ## For Cost-Sensitive Learning ##
 
@@ -370,16 +383,7 @@ if __name__ == '__main__':
             per_cls_weights = torch.ones(N_CLASSES).to(device)
 
         ## Choos a loss function ##
-
-        if ARGS.loss_type == 'CE':
-            criterion = nn.CrossEntropyLoss(weight=per_cls_weights, reduction='none').to(device)
-        elif ARGS.loss_type == 'Focal':
-            criterion = FocalLoss(weight=per_cls_weights, gamma=ARGS.focal_gamma, reduction='none').to(device)
-        elif ARGS.loss_type == 'LDAM':
-            criterion = LDAMLoss(cls_num_list=N_SAMPLES_PER_CLASS, max_m=0.5, s=30, weight=per_cls_weights,
-                                 reduction='none').to(device)
-        else:
-            raise ValueError("Wrong Loss Type")
+        criterion = nn.CrossEntropyLoss(weight=per_cls_weights, reduction='none').to(device)
 
         ## Training ( ARGS.warm is used for deferred re-balancing ) ##
 
@@ -392,27 +396,23 @@ if __name__ == '__main__':
             train_loss, train_acc = train_epoch(net, criterion, optimizer, train_loader, logger)
             train_stats = {'train_loss': train_loss, 'train_acc': train_acc}
             if epoch == 159:
-                save_checkpoint(train_acc, net, optimizer, epoch, True)
+                save_checkpoint(train_acc, net, optimizer, epoch, imb_type=ARGS.imb_type, index=True)
 
         ## Evaluation ##
+        test_stats = evaluate(net, test_loader, logger=logger)
+        TEST_ACC = test_stats['acc']
+        TEST_ACC_CLASS = test_stats['class_acc']
+        save_checkpoint(TEST_ACC, net, optimizer, epoch, imb_type=ARGS.imb_type)
 
-        val_eval = evaluate(net, val_loader, logger=logger)
-        val_acc = val_eval['acc']
-        if val_acc >= BEST_VAL:
-            BEST_VAL = val_acc
+        print(TEST_ACC)
+        print(TEST_ACC_CLASS)
 
-            test_stats = evaluate(net, test_loader, logger=logger)
-            TEST_ACC = test_stats['acc']
-            TEST_ACC_CLASS = test_stats['class_acc']
-
-            save_checkpoint(TEST_ACC, net, optimizer, epoch)
-            logger.log("========== Class-wise test performance ( avg : {} ) ==========".format(TEST_ACC_CLASS.mean()))
-            np.save(LOGDIR + '/classwise_acc.npy', TEST_ACC_CLASS.cpu())
 
         def _convert_scala(x):
             if hasattr(x, 'item'):
                 x = x.item()
             return x
+
 
         log_tr = ['train_loss', 'gen_loss', 'train_acc', 'gen_acc', 'p_g_orig', 'p_g_targ']
         log_te = ['loss', 'major_acc', 'neutral_acc', 'minor_acc', 'acc', 'f1_score']

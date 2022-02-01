@@ -9,6 +9,7 @@ import torchvision.transforms as transforms
 from data_loader import make_longtailed_imb, get_imbalanced, get_oversampled, get_smote
 from utils import InputNormalize, sum_t
 import models
+import random
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -55,11 +56,11 @@ def parse_args():
     parser.add_argument('--focal_gamma', default=1.0, type=float, help='Hyper-parameter for Focal Loss')
 
     parser.add_argument('--gen', '-gen', action='store_true', help='')
+    parser.add_argument('--create', action='store_true', help='')
     parser.add_argument('--step_size', default=0.1, type=float, help='')
     parser.add_argument('--attack_iter', default=10, type=int, help='')
 
     parser.add_argument('--imb_type', default='longtail', type=str,
-                        choices=['none', 'longtail', 'step'],
                         help='Type of artificial imbalance')
     parser.add_argument('--loss_type', default='CE', type=str,
                         choices=['CE', 'Focal', 'LDAM'],
@@ -76,13 +77,18 @@ def parse_args():
 
 
 ARGS = parse_args()
+print(ARGS)
 if ARGS.seed is not None:
     SEED = ARGS.seed
 else:
     SEED = np.random.randint(10000)
+
+SEED = 222
+
 np.random.seed(SEED)
 torch.manual_seed(SEED)
 torch.cuda.manual_seed_all(SEED)
+random.seed(SEED)
 
 DATASET = ARGS.dataset
 BATCH_SIZE = ARGS.batch_size
@@ -135,18 +141,33 @@ else:
 
 ## Data Loader ##
 
-N_SAMPLES_PER_CLASS_BASE = [int(N_SAMPLES)] * N_CLASSES
-if ARGS.imb_type == 'longtail':
-    N_SAMPLES_PER_CLASS_BASE = make_longtailed_imb(N_SAMPLES, N_CLASSES, ARGS.ratio)
-elif ARGS.imb_type == 'step':
-    for i in range(ARGS.imb_start, N_CLASSES):
-        N_SAMPLES_PER_CLASS_BASE[i] = int(N_SAMPLES * (1 / ARGS.ratio))
+# N_SAMPLES_PER_CLASS_BASE = [int(N_SAMPLES)] * N_CLASSES
+# if ARGS.imb_type == 'longtail':
+#     N_SAMPLES_PER_CLASS_BASE = make_longtailed_imb(N_SAMPLES, N_CLASSES, ARGS.ratio)
+# elif ARGS.imb_type == 'step':
+#     for i in range(ARGS.imb_start, N_CLASSES):
+#         N_SAMPLES_PER_CLASS_BASE[i] = int(N_SAMPLES * (1 / ARGS.ratio))
+#
+# N_SAMPLES_PER_CLASS_BASE = tuple(N_SAMPLES_PER_CLASS_BASE)
+# print("This",N_SAMPLES_PER_CLASS_BASE)
 
-N_SAMPLES_PER_CLASS_BASE = tuple(N_SAMPLES_PER_CLASS_BASE)
-print(N_SAMPLES_PER_CLASS_BASE)
+
+N_SAMPLES_PER_CLASS_BASE = [5000] * N_CLASSES
+if ARGS.imb_type == 'severe_imbalance':
+    fractions = np.ones(10) / 1000
+elif ARGS.imb_type == 'imbalance':
+    fractions = 0.001 + np.random.rand(10) / 100
+
+max_class = random.randint(0, 10)
+MAX_CLASS = max_class
+fractions[max_class] = 1.0
+
+N_SAMPLES_PER_CLASS_BASE = tuple([int(5000*i) for i in fractions])
+print("This",N_SAMPLES_PER_CLASS_BASE)
+
 
 train_loader, val_loader, test_loader = get_imbalanced(DATASET, N_SAMPLES_PER_CLASS_BASE, BATCH_SIZE,
-                                                       transform_train, transform_test)
+                                                       transform_train, transform_train, ARGS.imb_type, fractions, ARGS.create)
 
 ## To apply effective number for over-sampling or cost-sensitive ##
 
@@ -157,8 +178,10 @@ if ARGS.over and ARGS.effect_over:
     print(N_SAMPLES_PER_CLASS)
 else:
     N_SAMPLES_PER_CLASS = N_SAMPLES_PER_CLASS_BASE
-N_SAMPLES_PER_CLASS_T = torch.Tensor(N_SAMPLES_PER_CLASS).to(device)
 
+print("This 2", N_SAMPLES_PER_CLASS)
+N_SAMPLES_PER_CLASS_T = torch.Tensor(N_SAMPLES_PER_CLASS).to(device)
+print("This 3", N_SAMPLES_PER_CLASS_T)
 
 def adjust_learning_rate(optimizer, lr_init, epoch):
     """decrease the learning rate at 160 and 180 epoch ( from LDAM-DRW, NeurIPS19 )"""
